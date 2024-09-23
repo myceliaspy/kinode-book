@@ -118,14 +118,16 @@ Some of the code from the original fibonacci program is omitted for clarity, and
 ```rust
 use kinode_process_lib::{println, *};
 use serde::{Deserialize, Serialize};
-use sp1_core::{utils::BabyBearBlake3, SP1ProofWithIO, SP1Prover, SP1Stdin, SP1Verifier};
+use sp1_sdk::{utils, ProverClient, SP1ProofWithPublicValues, SP1Stdin};
 
-/// our circuit!
+/// The ELF we want to execute inside the zkVM.
 const FIB_ELF: &[u8] = include_bytes!("../../pkg/riscv32im-succinct-zkvm-elf");
 
 wit_bindgen::generate!({
-    path: "wit",
-    world: "process",
+    path: "target/wit",
+    world: "my-zk-app-template-dot-os-v0",
+    generate_unused_types: true,
+    additional_derives: [serde::Deserialize, serde::Serialize, process_macros::SerdeJsonInto],
 });
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -151,50 +153,57 @@ enum FibonacciResponse {
 fn fibonacci_proof(n: u32) -> Vec<u8> {
     let mut stdin = SP1Stdin::new();
     stdin.write(&n);
-    let proof = SP1Prover::prove(FIB_ELF, stdin).expect("proving failed");
-    println!("succesfully generated and verified proof for fib({n})!");
+
+    let client = ProverClient::new();
+    let (pk, _) = client.setup(FIB_ELF);
+    let proof = client.prove(&pk, stdin).run().unwrap();
+
+    println!("successfully generated and verified proof for fib({n})!");
     serde_json::to_vec(&proof).unwrap()
 }
 
 fn handle_message(our: &Address) -> anyhow::Result<()> {
     let message = await_message()?;
-    // we only handle requests directly -- responses are awaited in place.
-    // you can change this by using send() instead of send_and_await_response()
-    // in order to make this program more fluid and less blocking.
+
     match serde_json::from_slice(message.body())? {
         FibonacciRequest::ProveIt { target, n } => {
-            // we only accept this from our local node
             if message.source().node() != our.node() {
                 return Err(anyhow::anyhow!("got a request from a non-local node!"));
             }
-            // ask the target to do it for us
+
             let res = Request::to(Address::new(
                 target,
                 (our.process(), our.package(), our.publisher()),
             ))
             .body(serde_json::to_vec(&FibonacciRequest::Number(n))?)
             .send_and_await_response(30)??;
+
             let Ok(FibonacciResponse::Proof) = serde_json::from_slice(res.body()) else {
                 return Err(anyhow::anyhow!("got a bad response!"));
             };
-            let proof = res
+
+            let proof_bytes = res
                 .blob()
                 .ok_or_else(|| anyhow::anyhow!("no proof in response"))?
                 .bytes;
-            // verify the proof
-            let mut proof: SP1ProofWithIO<BabyBearBlake3> = serde_json::from_slice(&proof)?;
-            SP1Verifier::verify(FIB_ELF, &proof).map_err(|e| anyhow::anyhow!("{e:?}"))?;
-            // read result from proof
-            let output = proof.stdout.read::<u128>();
-            // send response containing number
+
+            // Deserialize and verify the proof
+            let client = ProverClient::new();
+            let (_, vk) = client.setup(FIB_ELF);
+            let mut proof: SP1ProofWithPublicValues = serde_json::from_slice(&proof_bytes)?;
+            client.verify(&proof, &vk).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+
+            // Read result from proof
+            let _ = proof.public_values.read::<u32>();
+            let _ = proof.public_values.read::<u32>();
+            let output = proof.public_values.read::<u128>();
+
             Response::new()
                 .body(serde_json::to_vec(&FibonacciResponse::Proven(output))?)
                 .send()?;
         }
         FibonacciRequest::Number(n) => {
-            // handle a remote request to prove a number
             let proof = fibonacci_proof(n);
-            // send the proof back to the requester
             Response::new()
                 .body(serde_json::to_vec(&FibonacciResponse::Proof)?)
                 .blob_bytes(proof)
@@ -205,9 +214,10 @@ fn handle_message(our: &Address) -> anyhow::Result<()> {
 }
 
 call_init!(init);
-fn init(our: Address) {
-    println!("fibonacci: begin");
 
+fn init(our: Address) {
+    utils::setup_logger();
+    println!("fibonacci: begin");
     loop {
         match handle_message(&our) {
             Ok(()) => {}
