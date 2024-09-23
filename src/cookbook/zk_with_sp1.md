@@ -60,7 +60,7 @@ First, add the SP1 dependency to the `Cargo.toml` file for `my_zk_app`:
 ```toml
 [dependencies]
 ...
-sp1-core = { git = "https://github.com/succinctlabs/sp1.git" }
+sp1-sdk = "2.0.0"
 ...
 ```
 
